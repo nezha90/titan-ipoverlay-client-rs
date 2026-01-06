@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, watch, mpsc};
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
@@ -58,14 +58,21 @@ pub struct Tunnel {
     tcp_timeout: u64,
     cancel_keepalive: watch::Sender<bool>,
     cancel_ws_reader: watch::Sender<bool>,
+    cancel_ws_writer: watch::Sender<bool>,
     version: String,
     http_client: Client,
+    // Non-blocking write queue for WebSocket messages
+    write_queue: mpsc::UnboundedSender<WsMessage>,
 }
 
 impl Tunnel {
     pub async fn new(opts: TunnelOptions) -> Result<Arc<Self>> {
         let (tx, _rx) = watch::channel(false);
         let (tx_reader, _rx2) = watch::channel(false);
+        let (tx_writer, _rx3) = watch::channel(false);
+        
+        // Create unbounded channel for write queue
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
 
         let t = Arc::new(Self {
             uuid: opts.uuid,
@@ -82,9 +89,14 @@ impl Tunnel {
             tcp_timeout: opts.tcp_timeout,
             cancel_keepalive: tx,
             cancel_ws_reader: tx_reader,
+            cancel_ws_writer: tx_writer,
             version: opts.version,
             http_client: Client::builder().timeout(Duration::from_secs(5)).build()?,
+            write_queue: write_tx,
         });
+
+        // Start the write queue processor
+        Tunnel::start_write_queue_processor(&t, write_rx).await;
 
         Tunnel::start_udp_idle_watchdog(&t).await;
         Ok(t)
@@ -211,6 +223,7 @@ impl Tunnel {
         // }
 
         let _ = self.cancel_ws_reader.send(true);
+        let _ = self.cancel_ws_writer.send(true);
 
         // self.clear_proxys().await;
         Ok(())
@@ -458,67 +471,28 @@ impl Tunnel {
     }
 
     async fn write(&self, data: &[u8]) -> Result<()> {
-        let mut guard = self.ws_writer.lock().await;
-        let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
-
-        let result = timeout(Duration::from_secs(WS_WRITE_TIMEOUT),
-            ws.send(WsMessage::Binary(data.to_vec()))
-        ).await;
-
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                error!("ws write failed: {}", e);
-                Err(anyhow::anyhow!(e))
-            }
-            Err(_) => {
-                error!("ws write timeout");
-                Err(anyhow::anyhow!("ws send timeout"))
-            }
-        }
+        // Non-blocking: just send to queue
+        self.write_queue
+            .send(WsMessage::Binary(data.to_vec()))
+            .map_err(|e| anyhow::anyhow!("write queue send failed: {}", e))?;
+        Ok(())
     }
 
     async fn write_ping(&self, data: &[u8]) -> Result<()> {
-        let mut guard = self.ws_writer.lock().await;
-        let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
-
-        let result = timeout(Duration::from_secs(WS_WRITE_TIMEOUT),
-             ws.send(WsMessage::Ping(data.to_vec()))
-        ).await;
-
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                error!("write_ping failed: {}", e);
-                Err(anyhow::anyhow!(e))
-            }
-            Err(_) => {
-                error!("write_ping timeout");
-                Err(anyhow::anyhow!("write_ping timeout"))
-            }
-        }
+        // Non-blocking: just send to queue
+        self.write_queue
+            .send(WsMessage::Ping(data.to_vec()))
+            .map_err(|e| anyhow::anyhow!("write_ping queue send failed: {}", e))?;
+        Ok(())
     }
 
     async fn write_pong(&self, data: &[u8]) -> Result<()> {
         debug!("onping");
-        let mut guard = self.ws_writer.lock().await;
-        let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
-
-        let result = timeout(Duration::from_secs(WS_WRITE_TIMEOUT),
-             ws.send(WsMessage::Pong(data.to_vec()))
-        ).await;
-
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                error!("write_pong failed: {}", e);
-                Err(anyhow::anyhow!(e))
-            }
-            Err(_) => {
-                error!("write_pong timeout");
-                Err(anyhow::anyhow!("write_pong timeout"))
-            }
-        }
+        // Non-blocking: just send to queue
+        self.write_queue
+            .send(WsMessage::Pong(data.to_vec()))
+            .map_err(|e| anyhow::anyhow!("write_pong queue send failed: {}", e))?;
+        Ok(())
     }
 
     async fn on_close(&self) { self.clear_proxys().await; }
@@ -580,6 +554,66 @@ impl Tunnel {
                 }
             }
         }
+    }
+
+    /// Start a dedicated task to process the write queue
+    /// This eliminates lock contention by serializing all writes through a single task
+    async fn start_write_queue_processor(this: &Arc<Self>, mut write_rx: mpsc::UnboundedReceiver<WsMessage>) {
+        let tunnel = Arc::clone(this);
+        
+        tokio::spawn(async move {
+            let mut shutdown = tunnel.cancel_ws_writer.subscribe();
+            
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            debug!("write queue processor shutting down");
+                            break;
+                        }
+                    }
+                    
+                    msg = write_rx.recv() => {
+                        match msg {
+                            Some(ws_msg) => {
+                                // Get writer and send message
+                                let mut guard = tunnel.ws_writer.lock().await;
+                                if let Some(ws) = guard.as_mut() {
+                                    let result = timeout(
+                                        Duration::from_secs(WS_WRITE_TIMEOUT),
+                                        ws.send(ws_msg)
+                                    ).await;
+                                    
+                                    match result {
+                                        Ok(Ok(())) => {
+                                            // Success - continue processing
+                                        }
+                                        Ok(Err(e)) => {
+                                            error!("ws write failed in queue processor: {}", e);
+                                            // Don't break - let reconnection logic handle it
+                                        }
+                                        Err(_) => {
+                                            error!("ws write timeout in queue processor");
+                                            // Don't break - let reconnection logic handle it
+                                        }
+                                    }
+                                } else {
+                                    debug!("ws_writer is None, skipping message");
+                                }
+                                // Release lock immediately after write
+                                drop(guard);
+                            }
+                            None => {
+                                debug!("write queue channel closed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            info!("write queue processor exited");
+        });
     }
 
     pub async fn start_udp_idle_watchdog(this: &Arc<Self>) {
