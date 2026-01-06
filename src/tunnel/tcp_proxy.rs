@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 use anyhow::Result;
 use log::{debug, error};
 use crate::tunnel::tunnel::Tunnel;
+use crate::tunnel::buffer_pool;
 use tokio::time::{timeout, Duration};
 
 
@@ -38,11 +39,13 @@ impl TcpProxy {
     }
 
     pub async fn proxy_conn(self: Arc<Self>, tunnel: Arc<Tunnel>) {
-        let mut buf = [0u8; 4096];
         loop {
+            // Acquire buffer from pool
+            let mut buf = buffer_pool::acquire();
+            
             let n = {
                 let mut reader = self.reader.lock().await;
-                match reader.read(&mut buf).await {
+                match reader.read(buf.as_mut_slice()).await {
                     Ok(0) => {
                         debug!("tcp proxy read eof id={}", self.id);
                         break;
@@ -54,9 +57,10 @@ impl TcpProxy {
                     }
                 }
             };
-            if let Err(e) = tunnel.on_proxy_session_data_from_proxy(&self.id, &buf[..n]).await {
+            if let Err(e) = tunnel.on_proxy_session_data_from_proxy(&self.id, buf.slice(n)).await {
                 log::error!("on_proxy_session_data_from_proxy error: {}", e);
             }
+            // Buffer is automatically returned to pool when dropped
         }
          if let Err(e)  = tunnel.on_proxy_conn_close(&self.id).await {
             log::error!("on_proxy_conn_close error: {}", e);

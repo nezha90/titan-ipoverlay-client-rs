@@ -8,6 +8,7 @@ use tokio::sync::{Notify};
 use tokio::time::{timeout, Duration};
 
 use crate::tunnel::tunnel::Tunnel;
+use crate::tunnel::buffer_pool;
 
 
 const UDP_WRITE_TIMEOUT: u64 = 3;
@@ -75,17 +76,19 @@ impl UdpProxy {
     }
 
     pub async fn serve(self: Arc<Self>, tunnel: Arc<Tunnel>) -> Result<()> {
-        let mut buf = vec![0u8; 4096];
-         loop {
+        loop {
+            // Acquire buffer from pool for each iteration
+            let mut buf = buffer_pool::acquire();
+            
             tokio::select! {
-                recv_res = self.socket.recv_from(&mut buf) => {
+                recv_res = self.socket.recv_from(buf.as_mut_slice()) => {
                     match recv_res {
                         Ok((n, _from)) => {
                             // update last_active
                             let mut t = self.last_active.lock().await;
                             *t = Instant::now();
 
-                            if let Err(e) = tunnel.on_proxy_udp_data_from_proxy(&self.id, &buf[..n]).await {
+                            if let Err(e) = tunnel.on_proxy_udp_data_from_proxy(&self.id, buf.slice(n)).await {
                                 error!("on_proxy_udp_data_from_proxy error: {}", e);
                             }
                         }
@@ -101,6 +104,7 @@ impl UdpProxy {
                     break;
                 }
             }
+            // Buffer is automatically returned to pool when dropped
         }
 
         if let Err(e) = tunnel.on_proxy_udp_close(&self.id).await {
