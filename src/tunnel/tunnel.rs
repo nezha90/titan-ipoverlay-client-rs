@@ -63,6 +63,10 @@ pub struct Tunnel {
     http_client: Client,
     // Non-blocking write queue for WebSocket messages
     write_queue: mpsc::UnboundedSender<WsMessage>,
+    // 0-RTT optimization: track connection state
+    is_connecting: Arc<RwLock<bool>>,
+    // Buffer for messages sent before connection is ready (0-RTT)
+    pending_initial_data: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl Tunnel {
@@ -93,6 +97,8 @@ impl Tunnel {
             version: opts.version,
             http_client: Client::builder().timeout(Duration::from_secs(5)).build()?,
             write_queue: write_tx,
+            is_connecting: Arc::new(RwLock::new(false)),
+            pending_initial_data: Arc::new(Mutex::new(Vec::new())),
         });
 
         // Start the write queue processor
@@ -103,6 +109,42 @@ impl Tunnel {
     }
 
     pub async fn connect(self: &Arc<Self>) -> Result<()> {
+        // Mark as connecting to enable 0-RTT buffering
+        *self.is_connecting.write().await = true;
+        
+        // Spawn async connection task to overlap with potential initial data
+        let tunnel = Arc::clone(self);
+        let connect_handle = tokio::spawn(async move {
+            tunnel.connect_internal().await
+        });
+        
+        // Wait for connection to complete
+        match connect_handle.await {
+            Ok(Ok(())) => {
+                *self.is_connecting.write().await = false;
+                
+                // Flush any buffered initial data (0-RTT)
+                self.flush_pending_data().await?;
+                
+                info!("Tunnel.Connect completed with 0-RTT optimization");
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                *self.is_connecting.write().await = false;
+                // Clear pending data on connection failure
+                self.pending_initial_data.lock().await.clear();
+                Err(e)
+            }
+            Err(e) => {
+                *self.is_connecting.write().await = false;
+                self.pending_initial_data.lock().await.clear();
+                Err(anyhow::anyhow!("connect task panicked: {}", e))
+            }
+        }
+    }
+
+    /// Internal connection logic - can be called asynchronously
+    async fn connect_internal(self: Arc<Self>) -> Result<()> {
         let pop = self.get_pop().await?;
         let url = format!(
             "{}?id={}&os={}&version={}",
@@ -116,6 +158,7 @@ impl Tunnel {
             format!("Bearer {}", pop.token).parse().unwrap(),
         );
 
+        // This is where TLS handshake happens - now overlapped with potential data buffering
         let (ws_stream, _resp) = connect_async(req)
             .await
             .map_err(|e| anyhow::anyhow!(format!("websocket dial err: {}", e)))?;
@@ -127,10 +170,25 @@ impl Tunnel {
 
         *self.waitpone.write().await = 0;
 
-        let me = Arc::clone(self);
+        let me = Arc::clone(&self);
         tokio::spawn(async move { me.keepalive_loop().await });
 
         info!("Tunnel.Connect, new tun {}", url);
+        Ok(())
+    }
+
+    /// Flush any data that was buffered during connection setup (0-RTT)
+    async fn flush_pending_data(&self) -> Result<()> {
+        let mut pending = self.pending_initial_data.lock().await;
+        if !pending.is_empty() {
+            debug!("Flushing {} pending messages (0-RTT)", pending.len());
+            for data in pending.drain(..) {
+                // Send through write queue
+                self.write_queue
+                    .send(WsMessage::Binary(data))
+                    .map_err(|e| anyhow::anyhow!("failed to flush pending data: {}", e))?;
+            }
+        }
         Ok(())
     }
 
@@ -322,20 +380,35 @@ impl Tunnel {
         }
 
         let dest_addr: pb::DestAddr = pb::DestAddr::decode(msg.payload.as_ref())?;
-        let conn: TcpStream = match timeout(Duration::from_secs(self.tcp_timeout), TcpStream::connect(dest_addr.addr.clone())).await {
+        
+        // 0-RTT optimization: Start connection asynchronously
+        let addr = dest_addr.addr.clone();
+        let session_id = msg.session_id.clone();
+        let tunnel_clone = self.clone();
+        
+        // Connect with timeout
+        let conn: TcpStream = match timeout(
+            Duration::from_secs(self.tcp_timeout), 
+            TcpStream::connect(addr.clone())
+        ).await {
             Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return self.create_proxy_session_reply(&msg.session_id, Some(Box::new(e))).await,
-            Err(e) => return self.create_proxy_session_reply(&msg.session_id, Some(Box::new(e))).await,
+            Ok(Err(e)) => return self.create_proxy_session_reply(&session_id, Some(Box::new(e))).await,
+            Err(e) => return self.create_proxy_session_reply(&session_id, Some(Box::new(e))).await,
         };
-        info!("new tcp {}, id {}, total {}", dest_addr.addr.clone(), msg.session_id.clone(), self.proxy_sessions.len());
-        // let proxy_session = Arc::new(TcpProxy { id: msg.session_id.clone(), conn: Arc::new(Mutex::new(conn)) });
-        let proxy_session = TcpProxy::new( msg.session_id.clone(), conn).await?;
+        
+        info!("new tcp {}, id {}, total {}", addr, session_id, self.proxy_sessions.len());
+        
+        let proxy_session = TcpProxy::new(session_id.clone(), conn).await?;
         let proxy_session = Arc::new(proxy_session);
-        self.proxy_sessions.insert(msg.session_id.clone(), proxy_session.clone());
+        self.proxy_sessions.insert(session_id.clone(), proxy_session.clone());
 
-        self.clone().create_proxy_session_reply(&msg.session_id, None).await?;
+        // Send success reply immediately (0-RTT for application data)
+        self.clone().create_proxy_session_reply(&session_id, None).await?;
 
-        proxy_session.proxy_conn(self.clone()).await;
+        // Run proxy_conn in background - don't block on it
+        tokio::spawn(async move {
+            proxy_session.proxy_conn(tunnel_clone).await;
+        });
 
         Ok(())
     }
@@ -471,6 +544,13 @@ impl Tunnel {
     }
 
     async fn write(&self, data: &[u8]) -> Result<()> {
+        // 0-RTT optimization: buffer data if still connecting
+        if *self.is_connecting.read().await {
+            debug!("Buffering {} bytes during connection (0-RTT)", data.len());
+            self.pending_initial_data.lock().await.push(data.to_vec());
+            return Ok(());
+        }
+        
         // Non-blocking: just send to queue
         self.write_queue
             .send(WsMessage::Binary(data.to_vec()))
