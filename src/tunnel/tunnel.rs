@@ -315,14 +315,20 @@ impl Tunnel {
             Err(e) => return self.create_proxy_session_reply(&msg.session_id, Some(Box::new(e))).await,
         };
         info!("new tcp {}, id {}, total {}", dest_addr.addr.clone(), msg.session_id.clone(), self.proxy_sessions.len());
-        // let proxy_session = Arc::new(TcpProxy { id: msg.session_id.clone(), conn: Arc::new(Mutex::new(conn)) });
-        let proxy_session = TcpProxy::new( msg.session_id.clone(), conn).await?;
+        
+        let proxy_session = TcpProxy::new(msg.session_id.clone(), conn).await?;
         let proxy_session = Arc::new(proxy_session);
         self.proxy_sessions.insert(msg.session_id.clone(), proxy_session.clone());
 
-        self.clone().create_proxy_session_reply(&msg.session_id, None).await?;
+        // 优化：立即启动 proxy_conn 在后台，不等待
+        let tunnel_clone = self.clone();
+        let proxy_clone = proxy_session.clone();
+        tokio::spawn(async move {
+            proxy_clone.proxy_conn(tunnel_clone).await;
+        });
 
-        proxy_session.proxy_conn(self.clone()).await;
+        // 并行发送确认回复（不等待 proxy_conn 完成）
+        self.clone().create_proxy_session_reply(&msg.session_id, None).await?;
 
         Ok(())
     }
