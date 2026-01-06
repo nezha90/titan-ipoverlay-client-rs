@@ -308,22 +308,67 @@ impl Tunnel {
             return self.create_proxy_session_reply(&msg.session_id, None).await;
         }
 
-        let dest_addr: pb::DestAddr = pb::DestAddr::decode(msg.payload.as_ref())?;
-        let conn: TcpStream = match timeout(Duration::from_secs(self.tcp_timeout), TcpStream::connect(dest_addr.addr.clone())).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return self.create_proxy_session_reply(&msg.session_id, Some(Box::new(e))).await,
-            Err(e) => return self.create_proxy_session_reply(&msg.session_id, Some(Box::new(e))).await,
-        };
-        info!("new tcp {}, id {}, total {}", dest_addr.addr.clone(), msg.session_id.clone(), self.proxy_sessions.len());
-        // let proxy_session = Arc::new(TcpProxy { id: msg.session_id.clone(), conn: Arc::new(Mutex::new(conn)) });
-        let proxy_session = TcpProxy::new( msg.session_id.clone(), conn).await?;
-        let proxy_session = Arc::new(proxy_session);
-        self.proxy_sessions.insert(msg.session_id.clone(), proxy_session.clone());
+        // 优化：将整个连接建立过程放到异步任务中，立即返回
+        // 这样可以在连接建立的同时处理其他请求和数据下发
+        let tunnel_clone = self.clone();
+        let session_id = msg.session_id.clone();
+        
+        tokio::spawn(async move {
+            // 解析目标地址
+            let dest_addr: pb::DestAddr = match pb::DestAddr::decode(msg.payload.as_ref()) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    error!("decode dest_addr failed: {}", e);
+                    let _ = tunnel_clone.create_proxy_session_reply(&session_id, Some(Box::new(e))).await;
+                    return;
+                }
+            };
+            
+            // 异步建立 TCP 连接
+            let conn: TcpStream = match timeout(
+                Duration::from_secs(tunnel_clone.tcp_timeout), 
+                TcpStream::connect(dest_addr.addr.clone())
+            ).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    error!("tcp connect failed: {}", e);
+                    let _ = tunnel_clone.create_proxy_session_reply(&session_id, Some(Box::new(e))).await;
+                    return;
+                }
+                Err(e) => {
+                    error!("tcp connect timeout: {}", e);
+                    let err: std::io::Error = std::io::Error::new(std::io::ErrorKind::TimedOut, e.to_string());
+                    let _ = tunnel_clone.create_proxy_session_reply(&session_id, Some(Box::new(err))).await;
+                    return;
+                }
+            };
+            
+            info!("new tcp {}, id {}, total {}", dest_addr.addr, session_id, tunnel_clone.proxy_sessions.len());
+            
+            // 创建 proxy session
+            let proxy_session = match TcpProxy::new(session_id.clone(), conn).await {
+                Ok(proxy) => Arc::new(proxy),
+                Err(e) => {
+                    error!("create tcp proxy failed: {}", e);
+                    let err: std::io::Error = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+                    let _ = tunnel_clone.create_proxy_session_reply(&session_id, Some(Box::new(err))).await;
+                    return;
+                }
+            };
+            
+            tunnel_clone.proxy_sessions.insert(session_id.clone(), proxy_session.clone());
 
-        self.clone().create_proxy_session_reply(&msg.session_id, None).await?;
+            // 发送成功确认
+            if let Err(e) = tunnel_clone.clone().create_proxy_session_reply(&session_id, None).await {
+                error!("send create_proxy_session_reply failed: {}", e);
+                return;
+            }
 
-        proxy_session.proxy_conn(self.clone()).await;
+            // 立即开始处理数据（与连接建立并行）
+            proxy_session.proxy_conn(tunnel_clone).await;
+        });
 
+        // 立即返回，不等待连接建立
         Ok(())
     }
 

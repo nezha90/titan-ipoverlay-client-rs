@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use anyhow::Result;
 use log::{debug, error};
 use crate::tunnel::tunnel::Tunnel;
@@ -13,8 +13,9 @@ const TCP_WRITE_TIMEOUT: u64 = 3;
 pub struct TcpProxy {
     pub id: String,
     reader: Mutex<ReadHalf<TcpStream>>,
-    writer: Mutex<WriteHalf<TcpStream>>,
+    writer: Arc<Mutex<WriteHalf<TcpStream>>>,
     raw: Arc<Mutex<TcpStream>>, // ✅ 保留原始连接，供 shutdown 使用
+    write_queue: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 impl TcpProxy {
@@ -28,13 +29,56 @@ impl TcpProxy {
         let stream = TcpStream::from_std(std_stream)?; // 原 stream 再恢复回异步版
 
         let (reader, writer) = tokio::io::split(stream);
-
-        Ok(Self {
-            id,
+        
+        // 创建写入队列
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        
+        let proxy = Self {
+            id: id.clone(),
             reader: Mutex::new(reader),
-            writer: Mutex::new(writer),
+            writer: Arc::new(Mutex::new(writer)),
             raw: Arc::new(Mutex::new(raw)),
-        })
+            write_queue: write_tx,
+        };
+        
+        // 启动写入队列处理器
+        let writer_arc = proxy.writer.clone();
+        let proxy_id = id.clone();
+        tokio::spawn(async move {
+            Self::write_queue_processor(proxy_id, writer_arc, write_rx).await;
+        });
+        
+        Ok(proxy)
+    }
+    
+    /// 写入队列处理器
+    async fn write_queue_processor(
+        id: String,
+        writer: Arc<Mutex<WriteHalf<TcpStream>>>,
+        mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>
+    ) {
+        while let Some(data) = write_rx.recv().await {
+            let mut writer_guard = writer.lock().await;
+            let result = timeout(
+                Duration::from_secs(TCP_WRITE_TIMEOUT),
+                writer_guard.write_all(&data)
+            ).await;
+            
+            match result {
+                Ok(Ok(())) => {
+                    // 写入成功
+                }
+                Ok(Err(e)) => {
+                    error!("tcp proxy {} write failed: {}", id, e);
+                    break;
+                }
+                Err(_) => {
+                    error!("tcp proxy {} write timeout", id);
+                    break;
+                }
+            }
+        }
+        debug!("tcp proxy {} write queue processor exited", id);
     }
 
     pub async fn proxy_conn(self: Arc<Self>, tunnel: Arc<Tunnel>) {
@@ -65,21 +109,11 @@ impl TcpProxy {
     }
 
     pub async fn write(&self, data: &[u8]) -> Result<()> {
-        let mut writer = self.writer.lock().await;
-
-        let result: std::result::Result<std::result::Result<(), std::io::Error>, tokio::time::error::Elapsed> = timeout(Duration::from_secs(TCP_WRITE_TIMEOUT), writer.write_all(data)).await;
-
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                error!("tcp proxy {} write failed: {}", self.id, e);
-                Err(anyhow::anyhow!(e.to_string()))
-            }
-            Err(_) => {
-                error!("tcp proxy {} write timeout", self.id);
-                Err(anyhow::anyhow!("tcp write timeout"))
-            }
-        }
+        // 非阻塞：直接发送到队列
+        self.write_queue
+            .send(data.to_vec())
+            .map_err(|e| anyhow::anyhow!("write queue send failed: {}", e))?;
+        Ok(())
     }
 
     async fn shutdown(&self) {
