@@ -291,13 +291,7 @@ impl Tunnel {
 
     async fn on_proxy_session_create(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
         debug!("on_proxy_session_create");
-        // self.clone().create_proxy_session(msg).await?;
-        let tunnel_clone = self.clone();
-        tokio::spawn(async move {
-             if let Err(e) = tunnel_clone.create_proxy_session(msg.clone()).await {
-                error!("create_proxy_session: {}", e);
-            }
-        });
+        self.clone().create_proxy_session(msg).await?;
         Ok(())
     }
 
