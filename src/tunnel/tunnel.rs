@@ -327,8 +327,9 @@ impl Tunnel {
                 Ok(addr) => addr,
                 Err(e) => {
                     error!("decode dest_addr failed: {}", e);
-                    tunnel_clone.proxy_sessions.remove(&session_id);
-                    let _ = tunnel_clone.create_proxy_session_reply(&session_id, Some(Box::new(e))).await;
+                    // 失败：发送 reply + close (close 会自动 remove session)
+                    let _ = tunnel_clone.clone().create_proxy_session_reply(&session_id, Some(Box::new(e))).await;
+                    let _ = tunnel_clone.on_proxy_conn_close(&session_id).await;
                     return;
                 }
             };
@@ -341,15 +342,17 @@ impl Tunnel {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(e)) => {
                     error!("tcp connect failed: {}", e);
-                    tunnel_clone.proxy_sessions.remove(&session_id);
-                    let _ = tunnel_clone.create_proxy_session_reply(&session_id, Some(Box::new(e))).await;
+                    // 失败：发送 reply + close (close 会自动 remove session)
+                    let _ = tunnel_clone.clone().create_proxy_session_reply(&session_id, Some(Box::new(e))).await;
+                    let _ = tunnel_clone.on_proxy_conn_close(&session_id).await;
                     return;
                 }
                 Err(e) => {
                     error!("tcp connect timeout: {}", e);
-                    tunnel_clone.proxy_sessions.remove(&session_id);
                     let err: std::io::Error = std::io::Error::new(std::io::ErrorKind::TimedOut, e.to_string());
-                    let _ = tunnel_clone.create_proxy_session_reply(&session_id, Some(Box::new(err))).await;
+                    // 失败：发送 reply + close (close 会自动 remove session)
+                    let _ = tunnel_clone.clone().create_proxy_session_reply(&session_id, Some(Box::new(err))).await;
+                    let _ = tunnel_clone.on_proxy_conn_close(&session_id).await;
                     return;
                 }
             };
@@ -362,7 +365,8 @@ impl Tunnel {
                 Err(_arc_proxy) => {
                     // 仍有其他引用，需要克隆（不太可能发生）
                     error!("cannot unwrap proxy arc for {}, this should not happen", session_id);
-                    tunnel_clone.proxy_sessions.remove(&session_id);
+                    // 失败：发送 close (close 会自动 remove session)
+                    let _ = tunnel_clone.on_proxy_conn_close(&session_id).await;
                     return;
                 }
             };
@@ -371,9 +375,10 @@ impl Tunnel {
                 Ok(p) => Arc::new(p),
                 Err(e) => {
                     error!("set_connection failed: {}", e);
-                    tunnel_clone.proxy_sessions.remove(&session_id);
                     let err: std::io::Error = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
-                    let _ = tunnel_clone.create_proxy_session_reply(&session_id, Some(Box::new(err))).await;
+                    // 失败：发送 reply + close (close 会自动 remove session)
+                    let _ = tunnel_clone.clone().create_proxy_session_reply(&session_id, Some(Box::new(err))).await;
+                    let _ = tunnel_clone.on_proxy_conn_close(&session_id).await;
                     return;
                 }
             };
@@ -381,7 +386,7 @@ impl Tunnel {
             // 更新 proxy_sessions 中的引用
             tunnel_clone.proxy_sessions.insert(session_id.clone(), proxy_with_conn.clone());
 
-            // 发送成功确认
+            // 成功：只发送 reply
             if let Err(e) = tunnel_clone.clone().create_proxy_session_reply(&session_id, None).await {
                 error!("send create_proxy_session_reply failed: {}", e);
                 return;
